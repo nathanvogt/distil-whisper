@@ -109,10 +109,12 @@ def init_student_model_from_teacher(
         cache_dir=cache_dir,
         subfolder=subfolder,
         low_cpu_mem_usage=True,
+        # max_source_positions=500
     )
     processor = WhisperProcessor.from_pretrained(teacher_checkpoint)
     generation_config = GenerationConfig.from_pretrained(teacher_checkpoint)
     generation_config.forced_decoder_ids = None
+    generation_config.max_source_positions = 500
 
     teacher_config = teacher_model.config
     teacher_encoder_layers = teacher_config.encoder_layers
@@ -123,8 +125,10 @@ def init_student_model_from_teacher(
         {
             "encoder_layers": encoder_layers if encoder_layers is not None else teacher_encoder_layers,
             "decoder_layers": decoder_layers,
+            "max_source_positions": 500,
         }
     )
+    print(f"{student_config=}")
 
     encoder_mapping = np.linspace(0, teacher_encoder_layers - 1, student_config.encoder_layers, dtype=int)
     encoder_mapping[-1] = teacher_encoder_layers - 1
@@ -142,10 +146,14 @@ def init_student_model_from_teacher(
     decoder_map = {}
     for student_layer, teacher_layer in enumerate(decoder_mapping):
         decoder_map[teacher_layer] = student_layer
-
     # init the student params from the teacher model
+    teacher_state_dict = teacher_model.state_dict()
+    updated = teacher_state_dict["model.encoder.embed_positions.weight"][:500, :].clone().detach()
+    print(f"NVOGTT {updated.shape=}")
+    teacher_state_dict["model.encoder.embed_positions.weight"] = teacher_state_dict["model.encoder.embed_positions.weight"][:500, :]
+
     student_model = WhisperForConditionalGeneration(student_config)
-    missing_keys, unexpected_keys = student_model.load_state_dict(teacher_model.state_dict(), strict=False)
+    missing_keys, unexpected_keys = student_model.load_state_dict(teacher_state_dict, strict=False)
     if len(missing_keys) > 0:
         raise RuntimeError(
             "Error(s) in loading state_dict for WhisperForConditionalGeneration. \n"
@@ -188,6 +196,7 @@ def init_student_model_from_teacher(
     if save_dir is not None:
         student_model.save_pretrained(save_dir)
         # we also need to correctly save the processor and generation config
+        processor.feature_extractor.chunk_length = 10
         processor.save_pretrained(save_dir)
         generation_config.save_pretrained(save_dir)
 

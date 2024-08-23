@@ -73,6 +73,8 @@ require_version("datasets>=2.14.6", "To fix: `pip install --upgrade datasets`")
 
 logger = get_logger(__name__)
 
+DISABLE_WANDB = True
+
 
 @dataclass
 class ModelArguments:
@@ -438,7 +440,6 @@ class DataCollatorSpeechSeq2SeqWithPadding:
     def __call__(self, features: List[Dict[str, Union[List[int], np.ndarray]]]) -> Dict[str, np.ndarray]:
         # split inputs and labels since they have to be of different lengths and need
         # different padding methods
-
         # dataloader returns a list of features which we convert to a dict
         input_features = {"input_features": [feature["input_features"] for feature in features]}
         label_features = {"input_ids": [feature["labels"] for feature in features]}
@@ -446,6 +447,17 @@ class DataCollatorSpeechSeq2SeqWithPadding:
         # reformat list to dict and set to pytorch format
         batch = self.processor.feature_extractor.pad(
             input_features,
+            padding=self.input_padding,
+            return_tensors="pt",
+        )
+        try:
+            student_input_features = {"input_features": [feature['student_input_features'] for feature in features]}
+        except Exception as e:
+            # print(f"NVOGTT student inputs failure. features: {features}")
+            raise e
+
+        student_inputs_batch = self.processor.feature_extractor.pad(
+            student_input_features,
             padding=self.input_padding,
             return_tensors="pt",
         )
@@ -474,6 +486,7 @@ class DataCollatorSpeechSeq2SeqWithPadding:
 
         batch["labels"] = labels
         batch["decoder_input_ids"] = decoder_input_ids
+        batch["student_input_features"] = student_inputs_batch.input_features
 
         return batch
 
@@ -508,6 +521,7 @@ def log_pred(
     prefix: str = "eval",
     num_lines: int = 200000,
 ):
+    if DISABLE_WANDB: return
     """Helper function to log target/predicted transcriptions to weights and biases (wandb)."""
     if accelerator.is_main_process:
         wandb_tracker = accelerator.get_tracker("wandb")
@@ -638,10 +652,13 @@ def load_multiple_datasets(
         desc="Combining datasets...",
         disable=not accelerator.is_local_main_process if accelerator is not None else False,
     ):
+        split = dataset_dict["split"]
+        split = f"{split}[:150]"
         dataset = load_dataset(
             dataset_dict["name"],
             dataset_dict["config"],
-            split=dataset_dict["split"],
+            # split=dataset_dict["split"],
+            split=split,
             streaming=streaming,
             **kwargs,
         )
@@ -811,15 +828,14 @@ def main():
         log_with=training_args.report_to,
         project_dir=training_args.output_dir,
     )
-
-    accelerator.init_trackers(
-        project_name=data_args.wandb_project,
-        init_kwargs={
-            "wandb": {"name": data_args.wandb_name,
-                      "dir": data_args.wandb_dir}
-        }
-
-    )
+    if not DISABLE_WANDB:
+        accelerator.init_trackers(
+            project_name=data_args.wandb_project,
+            init_kwargs={
+                "wandb": {"name": data_args.wandb_name,
+                            "dir": data_args.wandb_dir}
+            }
+        )
 
     # 3. Set-up basic logging
     # Create one log on every process with the configuration for debugging
@@ -915,10 +931,13 @@ def main():
             # load a single eval set
             dataset_dict = dataset_names_dict[0]
             all_eval_splits.append("eval")
+            split = dataset_dict['split']
+            split = f"{split}[:150]"
             raw_datasets["eval"] = load_dataset(
                 dataset_dict["name"],
                 dataset_dict["config"],
-                split=dataset_dict["split"],
+                # split=dataset_dict["split"],
+                split=split,
                 cache_dir=data_args.dataset_cache_dir,
                 token=model_args.token,
                 streaming=data_args.streaming,
@@ -964,7 +983,13 @@ def main():
         token=model_args.token,
     )
     feature_extractor = WhisperFeatureExtractor.from_pretrained(
-        (model_args.feature_extractor_name if model_args.feature_extractor_name else model_args.model_name_or_path),
+        (model_args.feature_extractor_name if model_args.feature_extractor_name else model_args.teacher_model_name_or_path),
+        cache_dir=model_args.cache_dir,
+        revision=model_args.model_revision,
+        token=model_args.token,
+    )
+    student_feature_extractor =  WhisperFeatureExtractor.from_pretrained(
+        model_args.model_name_or_path,
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         token=model_args.token,
@@ -1174,8 +1199,11 @@ def main():
         # process audio input
         audio = [sample["array"] for sample in batch["audio"]]
         inputs = feature_extractor(audio, sampling_rate=sampling_rate)
+        student_inputs = student_feature_extractor(audio, sampling_rate=sampling_rate)
         batch["input_features"] = inputs.input_features
+        batch["student_input_features"] = student_inputs.input_features
         batch["input_length"] = [len(sample) for sample in audio]
+        # student_inputs = student_feature_extractor(audio, sampling_rate=sampling_rate)
 
         # process text targets - for training these are the Whisper-generated pseudo-labels
         input_str_batched = batch[train_text_column_name]
@@ -1232,7 +1260,9 @@ def main():
         # process audio input
         sample = batch["audio"]
         inputs = feature_extractor(sample["array"], sampling_rate=sample["sampling_rate"])
+        student_inputs = student_feature_extractor(sample["array"], sampling_rate=sampling_rate)
         batch["input_features"] = inputs.input_features[0]
+        batch['student_input_features'] = student_inputs.input_features[0]
         batch["input_length"] = len(sample["array"])
 
         # process targets - for evaluation these are the ground-truth transcriptions
@@ -1248,7 +1278,7 @@ def main():
         map_fn_train = partial(
             raw_datasets["train"].map,
             function=prepare_train_dataset,
-            remove_columns=raw_datasets_train_features,
+            # remove_columns=raw_datasets_train_features,
             batched=True,
             batch_size=data_args.preprocessing_batch_size,
         )
@@ -1262,7 +1292,7 @@ def main():
         for eval_split in all_eval_splits:
             raw_datasets_eval_features = list(raw_datasets[eval_split].features.keys())
             map_fn_eval = partial(
-                raw_datasets[eval_split].map, function=prepare_eval_dataset, remove_columns=raw_datasets_eval_features
+                raw_datasets[eval_split].map, function=prepare_eval_dataset, #remove_columns=raw_datasets_eval_features
             )
             with accelerator.main_process_first():
                 vectorized_datasets[eval_split] = (
@@ -1298,7 +1328,6 @@ def main():
             if not data_args.streaming
             else filter_by_labels_fn()
         )
-
     # Pre-processing complete!
     # For large datasets it is advised to run the preprocessing on a
     # single machine first with `--preprocessing_only` since there will mostly likely
@@ -1469,7 +1498,12 @@ def main():
         student_model.train()
         teacher_model.eval()
 
-        student_outputs = student_model(**batch)
+        student_input = batch.copy()
+        student_input['input_features'] = student_input['student_input_features']
+        batch.pop('student_input_features', None)
+        student_input.pop('student_input_features', None)
+
+        student_outputs = student_model(**student_input)
         with torch.no_grad():
             if share_hidden_states:
                 # if the student and teacher share the same frozen encoder then we don't have to recompute the
@@ -1499,13 +1533,20 @@ def main():
         student_model.eval()
         teacher_model.eval()
 
+        student_input = batch.copy()
+        student_input['input_features'] = student_input['student_input_features']
+        batch.pop('student_input_features', None)
+        student_input.pop('student_input_features', None)
+
         with torch.no_grad():
-            student_outputs = student_model(**batch)
+            student_outputs = student_model(**student_input)
             if share_hidden_states:
                 encoder_outputs = BaseModelOutput(student_outputs.encoder_last_hidden_state.to(dtype=teacher_dtype))
                 teacher_outputs = teacher_model(encoder_outputs=encoder_outputs, labels=batch["labels"])
             else:
                 teacher_outputs = teacher_model(**batch)
+
+        batch['student_input_features'] = student_input['input_features']
 
         # CE (data) loss
         ce_loss = student_outputs.loss
@@ -1523,7 +1564,7 @@ def main():
 
     def generate_step(batch):
         student_model.eval()
-        output_ids = accelerator.unwrap_model(student_model).generate(batch["input_features"], **gen_kwargs)
+        output_ids = accelerator.unwrap_model(student_model).generate(batch["student_input_features"], **gen_kwargs)
         output_ids = accelerator.pad_across_processes(output_ids, dim=1, pad_index=tokenizer.pad_token_id)
         return output_ids
 
@@ -1641,7 +1682,11 @@ def main():
                     feature_extractor.save_pretrained(intermediate_dir)
                     tokenizer.save_pretrained(intermediate_dir)
                     config.save_pretrained(intermediate_dir)
-                    student_model.generation_config.save_pretrained(intermediate_dir)
+                    try:
+                        student_model.generation_config.save_pretrained(intermediate_dir)
+                    except Exception as e:
+                        logging.warning(e)
+                        pass
 
                     accelerator.wait_for_everyone()
                     if accelerator.is_main_process:
@@ -1665,7 +1710,6 @@ def main():
                         eval_preds = []
                         eval_labels = []
                         eval_start = time.time()
-
                         validation_dataloader = DataLoader(
                             vectorized_datasets[eval_split],
                             collate_fn=data_collator,
@@ -1754,7 +1798,11 @@ def main():
                         feature_extractor.save_pretrained(intermediate_dir)
                         tokenizer.save_pretrained(intermediate_dir)
                         config.save_pretrained(intermediate_dir)
-                        student_model.generation_config.save_pretrained(intermediate_dir)
+                        try:
+                            student_model.generation_config.save_pretrained(intermediate_dir)
+                        except Exception as e:
+                            print(f"NVOGTT error while saving {e}")
+                            pass
 
                         accelerator.wait_for_everyone()
 
